@@ -1,0 +1,152 @@
+version: '3.8'
+
+services:
+
+  # ── Main Talos backend ──────────────────────────────────────────────────────
+  talos:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: talos/v4:latest
+    container_name: talos-orchestrator
+    restart: unless-stopped
+    env_file:
+      - ${HOME}/talos/config/talos.env
+    volumes:
+      - ${HOME}/talos/skills:/talos/skills
+      - ${HOME}/talos/keys:/talos/keys:ro
+      - ${HOME}/talos/logs:/talos/logs
+      - ${HOME}/talos/data:/talos/data
+      - ${HOME}/talos/config:/talos/config:ro
+      - ${HOME}/talos/backups:/talos/backups
+      - ${HOME}/talos/tmp:/talos/tmp
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - talos-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── Redis — short-term memory (512MB LRU) ───────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: talos-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+      --save 900 1
+      --save 300 10
+    volumes:
+      - ${HOME}/talos/data/redis:/data
+    networks:
+      - talos-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ── ChromaDB — long-term vector memory (100K vectors max) ──────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: talos-chromadb
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - ${HOME}/talos/data/chromadb:/chroma/chroma
+    networks:
+      - talos-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 15s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # ── Ollama — local LLM server (Qwen Coder 7B + Qwen VL) ───────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: talos-ollama
+    restart: unless-stopped
+    volumes:
+      - ${HOME}/talos/data/ollama:/root/.ollama
+    networks:
+      - talos-net
+    # GPU passthrough — comment out if no NVIDIA GPU available
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Socket Proxy — restricted Docker API access ─────────────────────────────
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: talos-socket-proxy
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Default deny all
+      DEFAULT_POLICY: "0"
+      # Allow only container operations needed by Talos
+      CONTAINERS: "1"
+      POST_CONTAINERS_START: "1"
+      POST_CONTAINERS_STOP: "1"
+      POST_CONTAINERS_CREATE: "1"
+      GET_CONTAINERS_JSON: "1"
+      GET_CONTAINERS_ID_JSON: "1"
+      GET_CONTAINERS_ID_LOGS: "1"
+      # Deny all destructive operations
+      DELETE_CONTAINERS_ID: "0"
+      IMAGES: "0"
+      VOLUMES: "0"
+      NETWORKS: "0"
+      SYSTEM: "0"
+      BUILD: "0"
+      EXEC: "0"
+      SWARM: "0"
+    networks:
+      - talos-net
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:2375/_ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  talos-net:
+    driver: bridge
+    name: talos-net
